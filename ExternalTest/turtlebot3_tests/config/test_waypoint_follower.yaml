@@ -1,0 +1,4 @@
+tb3_nav2_waypointfollow_tester:
+  ros__parameters:
+    waypoints: ['-0.52, -0.78', '-0.7, 0.5', '2.0, -1.5', '1.7, 1.7']
+    initial_pose: [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]

@@ -1,26 +1,12 @@
 #! /usr/bin/env python3
 # Copyright 2020-2021 Rapyuta Robotics Co., Ltd.
 
-import os
 import time
-import unittest
-from ament_index_python import get_package_share_directory
-
-import launch
-import launch.actions
-from launch.actions import IncludeLaunchDescription
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-import launch_ros.actions
-import launch_testing.actions
-import launch_testing.markers
-import launch_testing.util
-import pytest
 
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.action import ActionClient
-from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSHistoryPolicy, QoSReliabilityPolicy
 
 from action_msgs.msg import GoalStatus
@@ -31,14 +17,28 @@ from nav2_msgs.srv import ManageLifecycleNodes
 """
 Ref: https://github.com/ros-planning/navigation2/blob/main/nav2_system_tests/src/waypoint_follower/tester.py
 """
-class WaypointFollower(Node):
-    def __init__(self):
-        super().__init__(node_name='nav2_waypoint_tester', namespace='')
-        self.waypoints = None
+class WaypointsFollower(Node):
+    def __init__(self, in_node_name):
+        super().__init__(node_name=in_node_name, namespace='')
+        
+        self.declare_parameter("waypoints", [])
+        self.declare_parameter("initial_pose", [])
+
+        waypoints = []
+        wps_param = self.get_parameter("waypoints").value
+        print(wps_param)
+        for wp in wps_param:
+            wp_vals = wp.split(',')
+            waypoints.append([float(wp_vals[0]), float(wp_vals[1])])
+        self.set_waypoints(waypoints)
         self.action_client = ActionClient(self, FollowWaypoints, 'FollowWaypoints')
+
+        self.initial_pose = self.get_parameter("initial_pose").value        
         self.initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped,
-                                                      'initialpose', 10)
+                                                      'initialpose_pub', 10)
         self.initial_pose_received = False
+        self.publish_initial_pose(self.initial_pose)
+        
         self.goal_handle = None
 
         pose_qos = QoSProfile(
@@ -48,31 +48,67 @@ class WaypointFollower(Node):
           depth=1)
 
         self.model_pose_sub = self.create_subscription(PoseWithCovarianceStamped,
-                                                       'amcl_pose', self.poseCallback, pose_qos)
+                                                       'amcl_pose', self.pose_callback, pose_qos)
 
-    def setInitialPose(self, pose):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exep_type, exep_value, trace):
+        if exep_type is not None:
+            raise Exception('Exception occured, value: ', exep_value)
+        self.shutdown()
+
+    def shutdown(self):
+        #self.shutdown_nav_lifecycle()
+        self.destroy_node()
+
+    def publish_initial_pose(self, in_pose):
+        assert(len(in_pose) >= 7)
         self.init_pose = PoseWithCovarianceStamped()
-        self.init_pose.pose.pose.position.x = pose[0]
-        self.init_pose.pose.pose.position.y = pose[1]
+        self.init_pose.pose.pose.position.x = in_pose[0]
+        self.init_pose.pose.pose.position.y = in_pose[1]
+        self.init_pose.pose.pose.position.z = in_pose[2]
+        self.init_pose.pose.pose.orientation.x = in_pose[3]
+        self.init_pose.pose.pose.orientation.y = in_pose[4]
+        self.init_pose.pose.pose.orientation.z = in_pose[5]
+        self.init_pose.pose.pose.orientation.w = in_pose[6]
         self.init_pose.header.frame_id = 'map'
-        self.publishInitialPose()
+        self.initial_pose_pub.publish(self.init_pose)
         time.sleep(5)
 
-    def poseCallback(self, msg):
+    def pose_callback(self, msg):
         self.info_msg('Received amcl_pose')
         self.initial_pose_received = True
 
-    def setWaypoints(self, waypoints):
-        if not self.waypoints:
-            self.waypoints = []
+    def set_waypoints(self, in_waypoints):
+        self.waypoints = []
 
-        for wp in waypoints:
+        for wp in in_waypoints:
             msg = PoseStamped()
             msg.header.frame_id = 'map'
             msg.pose.position.x = wp[0]
             msg.pose.position.y = wp[1]
             msg.pose.orientation.w = 1.0
             self.waypoints.append(msg)
+
+    def follow_waypoints(self):
+        # Wait for the whole nav2 stack to be setup
+        time.sleep(10)
+        retry_count = 0
+        retries = 2
+        while not self.initial_pose_received and retry_count <= retries:
+            retry_count += 1
+            self.info_msg(f'Setting initial pose {self.initial_pose}')
+            self.publish_initial_pose(self.initial_pose)
+            self.info_msg('Waiting for amcl_pose to be received')
+            rclpy.spin_once(self, timeout_sec=1.0)  # wait for pose_callback
+
+        result = self.run(block=True)
+        if not result:
+            self.error_msg('Following waypoints FAILED')
+        else:
+            self.info_msg('Following waypoints PASSED')
+        return result
 
     def run(self, block):
         if not self.waypoints:
@@ -121,11 +157,8 @@ class WaypointFollower(Node):
         self.info_msg('Goal succeeded!')
         return True
 
-    def publishInitialPose(self):
-        self.initial_pose_pub.publish(self.init_pose)
-
-    def shutdown(self):
-        self.info_msg('Shutting down')
+    def shutdown_nav_lifecycle(self):
+        self.info_msg('Nav life cycle shutting down')
         transition_service = 'lifecycle_manager_navigation/manage_nodes'
         mgr_client = self.create_client(ManageLifecycleNodes, transition_service)
         while not mgr_client.wait_for_service(timeout_sec=1.0):
@@ -167,74 +200,9 @@ class WaypointFollower(Node):
     def error_msg(self, msg: str):
         self.get_logger().error(msg)
 
-def follow_waypoints():
-    # wait a few seconds to make sure entire stacks are up
-    time.sleep(10)
-
-    wps = [[-0.52, -0.78], [-0.7, 0.5], [2.0, -1.5], [1.7, 1.7]]
-    starting_pose = [-1.0, 0.0]
-
-    test = WaypointFollower()
-    test.setWaypoints(wps)
-
-    retry_count = 0
-    retries = 2
-    while not test.initial_pose_received and retry_count <= retries:
-        retry_count += 1
-        test.info_msg(f'Setting initial pose {starting_pose}')
-        test.setInitialPose(starting_pose)
-        test.info_msg('Waiting for amcl_pose to be received')
-        rclpy.spin_once(test, timeout_sec=1.0)  # wait for poseCallback
-
-    result = test.run(True)
-    if not result:
-        test.error_msg('Following waypoints FAILED')
-    else:
-        test.info_msg('Following waypoints PASSED')
-    return result
-
-"""
-Test basic navigation following waypoints
-"""
-
-@pytest.mark.launch_test
-@launch_testing.markers.keep_alive
-def generate_test_description():
-    # [tb3_model] arg
-    tb3_model = launch.substitutions.LaunchConfiguration('tb3_model', default='burger')
-
-    # Bringup the turtlebot3
-    tb3_robot_launch = IncludeLaunchDescription(
-        launch_description_source=PythonLaunchDescriptionSource(
-            os.path.join(
-                get_package_share_directory('turtlebot3_bringup'),
-                'launch/robot.launch.py')),
-        launch_arguments={'use_sim_time': 'False'}.items()
-    )
-
-    # Start tb3 nav2
-    tb3_nav2_launch = IncludeLaunchDescription(
-        launch_description_source=PythonLaunchDescriptionSource(
-            os.path.join(
-                get_package_share_directory('nav2_bringup'),
-                'launch/tb3_simulation_launch.py')),
-        launch_arguments={'use_simulator': 'False', 'headless': 'True', 'map':'maps/Turtlebot3_benchmark.yaml'}.items()
-    )
-
-    return launch.LaunchDescription([
-        launch.actions.DeclareLaunchArgument(
-            'tb3_model',
-            default_value=tb3_model,
-            description='turtlebot3 model (burger or waffle)'),
-        launch.actions.SetEnvironmentVariable('TURTLEBOT3_MODEL', tb3_model),
-        tb3_robot_launch,
-        tb3_nav2_launch,
-        launch_testing.util.KeepAliveProc(),
-        launch_testing.actions.ReadyToTest()
-    ])
-
-class TestWaypointFollower(unittest.TestCase):
-    def test_waypoint_follower(self, proc_output):
-        rclpy.init()
-        assert follow_waypoints(), 'Waypoint failed being followed!'
-        rclpy.shutdown()
+if __name__ == '__main__':
+    rclpy.init()
+    with WaypointsFollower(in_node_name='tb3_nav2_waypointfollower') as wps_follower:
+        wps_follower.follow_waypoints()
+    rclpy.shutdown()
+    

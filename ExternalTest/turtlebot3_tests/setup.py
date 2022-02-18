@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import setup
 
 package_name = 'turtlebot3_tests'
@@ -9,7 +11,10 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        (f'lib/{package_name}', glob(f'{package_name}/[!_]**')),
+        (f'share/{package_name}', ['package.xml']),
+        (f'share/{package_name}/config', glob('config/*.yaml')),
+        (f'share/{package_name}/test', glob('test/[!_]**')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -20,6 +25,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'waypoints_follower = turtlebot3_tests.waypoints_follower:main',
         ],
     },
 )
